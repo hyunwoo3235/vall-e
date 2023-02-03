@@ -8,8 +8,11 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from transformers.modeling_flax_utils import FlaxPreTrainedModel, ACT2FN
+from transformers.utils import logging
 
 from .configuration_vall_e import VALLEConfig
+
+logger = logging.get_logger(__name__)
 
 
 def create_sinusoidal_positions(
@@ -44,7 +47,6 @@ class AdaLN(nn.Module):
         a, b = jnp.split(self.embed(level), 2, axis=-1)
         hidden_states = self.ln(hidden_states)
         return a * hidden_states + b
-
 
 
 class FlaxVALLEMLP(nn.Module):
@@ -168,9 +170,11 @@ class FlaxVALLELayer(nn.Module):
     def setup(self):
         self.use_adaln = self.config.num_embed_levels > 1
 
-        self.ln_1 = AdaLN(self.config, dtype=self.dtype) if self.use_adaln else nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
+        self.ln_1 = AdaLN(self.config, dtype=self.dtype) if self.use_adaln else nn.LayerNorm(
+            epsilon=self.config.layer_norm_eps, dtype=self.dtype)
         self.attention = FlaxVALLEAttention(self.config, dtype=self.dtype)
-        self.ln_2 = AdaLN(self.config, dtype=self.dtype) if self.use_adaln else nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
+        self.ln_2 = AdaLN(self.config, dtype=self.dtype) if self.use_adaln else nn.LayerNorm(
+            epsilon=self.config.layer_norm_eps, dtype=self.dtype)
         self.mlp = FlaxVALLEMLP(self.config, dtype=self.dtype)
 
     def __call__(
