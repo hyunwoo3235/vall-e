@@ -7,20 +7,44 @@ from flax.core import FrozenDict, unfreeze, freeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
+from transformers.modeling_flax_utils import FlaxPreTrainedModel, ACT2FN
 
-from vall_e.modeling_flax_utils import ACT2FN
 from .configuration_vall_e import VALLEConfig
 
 
 def create_sinusoidal_positions(
-    max_len: int, dim: int, dtype: jnp.dtype = jnp.float32
+        max_len: int, dim: int, dtype: jnp.dtype = jnp.float32
 ) -> jnp.ndarray:
     inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2, dtype=dtype) / dim))
     sinusoid_inp = jnp.einsum("i,j->ij", jnp.arange(max_len, dtype=dtype), inv_freq)
     sin, cos = jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
     pos_emb = jnp.concatenate([sin, cos], axis=-1)
     return pos_emb
+
+
+class AdaLN(nn.Module):
+    config: VALLEConfig
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        self.embed = nn.Embed(
+            self.config.num_embed_levels,
+            self.config.hidden_size * 2,
+            embedding_init=jax.nn.initializers.normal(
+                self.config.initializer_range, self.dtype
+            ),
+            dtype=self.dtype,
+        )
+        self.ln = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
+
+    def __call__(self, hidden_states, level=None):
+        if level is None:
+            level = jnp.zeros((hidden_states.shape[0],), dtype=jnp.int32)
+
+        a, b = jnp.split(self.embed(level), 2, axis=-1)
+        hidden_states = self.ln(hidden_states)
+        return a * hidden_states + b
+
 
 
 class FlaxVALLEMLP(nn.Module):
@@ -88,11 +112,11 @@ class FlaxVALLEAttention(nn.Module):
         )
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        deterministic: bool = True,
-        output_attentions: bool = False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
     ):
 
         qkv = self.query_key_value(hidden_states)
@@ -142,26 +166,29 @@ class FlaxVALLELayer(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
+        self.use_adaln = self.config.num_embed_levels > 1
+
+        self.ln_1 = AdaLN(self.config, dtype=self.dtype) if self.use_adaln else nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
         self.attention = FlaxVALLEAttention(self.config, dtype=self.dtype)
-        self.ln_2 = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
+        self.ln_2 = AdaLN(self.config, dtype=self.dtype) if self.use_adaln else nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
         self.mlp = FlaxVALLEMLP(self.config, dtype=self.dtype)
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        deterministic=True,
-        output_attentions=False,
+            self,
+            hidden_states,
+            attention_mask=None,
+            level=None,
+            deterministic=True,
+            output_attentions=False,
     ):
         residual = hidden_states
-        hidden_states = self.ln_1(hidden_states)
+        hidden_states = self.ln_1(hidden_states, level=level) if self.use_adaln else self.ln_1(hidden_states)
         atten_outputs = self.attention(hidden_states, deterministic=deterministic)
         atten_output = atten_outputs[0]
         hidden_states = residual + atten_output
 
         residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)
+        hidden_states = self.ln_2(hidden_states, level=level) if self.use_adaln else self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(
             hidden_states, deterministic=deterministic
         )
@@ -184,13 +211,14 @@ class FlaxVALLELayerCollection(nn.Module):
         ]
 
     def __call__(
-        self,
-        hidden_states,
-        attention_mask=None,
-        deterministic=True,
-        output_attentions=False,
-        output_hidden_states=False,
-        return_dict=True,
+            self,
+            hidden_states,
+            attention_mask=None,
+            level=None,
+            deterministic=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
     ):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -202,6 +230,7 @@ class FlaxVALLELayerCollection(nn.Module):
             layer_outputs = layer(
                 hidden_states,
                 attention_mask,
+                level=level,
                 deterministic=deterministic,
                 output_attentions=output_attentions,
             )
@@ -285,13 +314,13 @@ class FlaxVALLEEmbeddings(nn.Module):
         )
 
     def __call__(
-        self,
-        phoneme_ids: jnp.ndarray,
-        prompt_ids: jnp.ndarray = None,
-        speech_ids: jnp.ndarray = None,
-        phoneme_attention_mask: jnp.ndarray = None,
-        prompt_attention_mask: jnp.ndarray = None,
-        speech_attention_mask: jnp.ndarray = None,
+            self,
+            phoneme_ids: jnp.ndarray,
+            prompt_ids: jnp.ndarray = None,
+            speech_ids: jnp.ndarray = None,
+            phoneme_attention_mask: jnp.ndarray = None,
+            prompt_attention_mask: jnp.ndarray = None,
+            speech_attention_mask: jnp.ndarray = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         bs = phoneme_ids.shape[0]
         phoneme_embeddings = self.phoneme_embeddings(phoneme_ids)
@@ -379,17 +408,18 @@ class VALLEModule(nn.Module):
         )
 
     def __call__(
-        self,
-        phoneme_ids,
-        prompt_ids=None,
-        speech_ids=None,
-        phoneme_attention_mask=None,
-        prompt_attention_mask=None,
-        speech_attention_mask=None,
-        deterministic=True,
-        output_attentions=False,
-        output_hidden_states=False,
-        return_dict=True,
+            self,
+            phoneme_ids,
+            prompt_ids=None,
+            speech_ids=None,
+            phoneme_attention_mask=None,
+            prompt_attention_mask=None,
+            speech_attention_mask=None,
+            level=None,
+            deterministic=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
     ):
         hidden_states, attention_mask = self.embeddings(
             phoneme_ids,
@@ -403,6 +433,7 @@ class VALLEModule(nn.Module):
         outputs = self.encoder(
             hidden_states,
             attention_mask,
+            level=level,
             deterministic=deterministic,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -427,13 +458,13 @@ class FlaxVALLEPreTrainedModel(FlaxPreTrainedModel):
     module_class: nn.Module = None
 
     def __init__(
-        self,
-        config: VALLEConfig,
-        input_shape: Tuple = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
-        **kwargs,
+            self,
+            config: VALLEConfig,
+            input_shape: Tuple = (1, 1),
+            seed: int = 0,
+            dtype: jnp.dtype = jnp.float32,
+            _do_init: bool = True,
+            **kwargs,
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
         super().__init__(
@@ -446,7 +477,7 @@ class FlaxVALLEPreTrainedModel(FlaxPreTrainedModel):
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+            self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
     ) -> FrozenDict:
         phoneme_ids = jnp.zeros(input_shape, dtype="i4")
         if self.config.num_embed_levels > 1:
@@ -487,19 +518,20 @@ class FlaxVALLEPreTrainedModel(FlaxPreTrainedModel):
             return random_params
 
     def __call__(
-        self,
-        phoneme_ids,
-        prompt_ids=None,
-        speech_ids=None,
-        phoneme_attention_mask=None,
-        prompt_attention_mask=None,
-        speech_attention_mask=None,
-        params: dict = None,
-        dropout_rng: jax.random.PRNGKey = None,
-        train: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        return_dict: bool = True,
+            self,
+            phoneme_ids,
+            prompt_ids=None,
+            speech_ids=None,
+            phoneme_attention_mask=None,
+            prompt_attention_mask=None,
+            speech_attention_mask=None,
+            level=None,
+            params: dict = None,
+            dropout_rng: jax.random.PRNGKey = None,
+            train: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
     ):
         output_attentions = (
             output_attentions
@@ -527,6 +559,7 @@ class FlaxVALLEPreTrainedModel(FlaxPreTrainedModel):
             phoneme_attention_mask=phoneme_attention_mask,
             prompt_attention_mask=prompt_attention_mask,
             speech_attention_mask=speech_attention_mask,
+            level=level,
             deterministic=not train,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
