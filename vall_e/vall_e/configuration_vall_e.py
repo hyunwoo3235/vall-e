@@ -19,6 +19,8 @@ class VALLEConfig(PretrainedConfig):
         attention_dropout_prob: float = 0.1,
         initializer_range: float = 0.02,
         layer_norm_eps: float = 1e-5,
+        phoneme_pad_token_id: int = 0,
+        codec_pad_token_id: int = 1024,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -35,3 +37,5 @@ class VALLEConfig(PretrainedConfig):
         self.attention_dropout_prob = attention_dropout_prob
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
+        self.phoneme_pad_token_id = phoneme_pad_token_id
+        self.codec_pad_token_id = codec_pad_token_id

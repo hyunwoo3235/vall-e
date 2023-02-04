@@ -336,6 +336,21 @@ class FlaxVALLEEmbeddings(nn.Module):
 
         embeddings = phoneme_embeddings
         attention_mask = phoneme_attention_mask
+        embeddings = jnp.concatenate(
+            [
+                embeddings,
+                jnp.repeat(self.separator, bs, axis=0),
+            ],
+            axis=1,
+        )
+        attention_mask = jnp.concatenate(
+            [
+                attention_mask,
+                jnp.zeros((bs, 1)),
+            ],
+            axis=1,
+        )
+
         if prompt_ids is not None:
             prompt_embeddings = self.acoustic_embeddings(prompt_ids)
             prompt_embeddings += create_sinusoidal_positions(
@@ -350,16 +365,16 @@ class FlaxVALLEEmbeddings(nn.Module):
             embeddings = jnp.concatenate(
                 [
                     embeddings,
-                    jnp.repeat(self.separator, bs, axis=0),
                     prompt_embeddings,
+                    jnp.repeat(self.separator, bs, axis=0),
                 ],
                 axis=1,
             )
             attention_mask = jnp.concatenate(
                 [
                     attention_mask,
-                    jnp.ones((bs, 1), dtype=self.dtype),
                     prompt_attention_mask,
+                    jnp.zeros((bs, 1)),
                 ],
                 axis=1,
             )
@@ -378,7 +393,6 @@ class FlaxVALLEEmbeddings(nn.Module):
             embeddings = jnp.concatenate(
                 [
                     embeddings,
-                    jnp.repeat(self.separator, bs, axis=0),
                     speech_embeddings,
                 ],
                 axis=1,
@@ -386,7 +400,6 @@ class FlaxVALLEEmbeddings(nn.Module):
             attention_mask = jnp.concatenate(
                 [
                     attention_mask,
-                    jnp.ones((bs, 1), dtype=self.dtype),
                     speech_attention_mask,
                 ],
                 axis=1,
